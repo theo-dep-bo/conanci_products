@@ -1,0 +1,226 @@
+# Azure Pipelines pipeline for the products repository.
+#
+# Orchestrates the full build and promotion of all Conan products (game, mapviewer)
+# and their transitive dependencies, using Conan's build-order workflow.
+#
+# Flow:
+#   Lock  →  Level0  →  Level1  →  Level2  →  Level3  →  Promotion
+#
+# Each Level stage builds all Conan packages at that dependency level in parallel
+# for linux and windows.  Packages at a given level are built sequentially within
+# each OS job (Azure Pipelines does not support runtime-dynamic job matrices).
+#
+# After all levels complete successfully (or are skipped because packages are
+# already present), the Promotion stage merges all uploaded package lists and
+# promotes them from the "products" staging remote to the "develop" release remote.
+
+trigger: none
+pr: none
+
+resources:
+  repositories:
+    - repository: conf
+      type: github
+      name: theo-dep-bo/conanci_conf
+      ref: refs/heads/main
+      endpoint: github-theo-dep-bo
+    - repository: github-products
+      type: github
+      name: theo-dep-bo/conanci_products
+      ref: refs/heads/main
+      endpoint: github-theo-dep-bo
+    - repository: github-game
+      type: github
+      name: theo-dep-bo/conanci_game
+      ref: refs/heads/main
+      endpoint: github-theo-dep-bo
+    - repository: github-mapviewer
+      type: github
+      name: theo-dep-bo/conanci_mapviewer
+      ref: refs/heads/main
+      endpoint: github-theo-dep-bo
+
+  pipelines:
+    - pipeline: ai
+      source: theo-dep-bo.conanci_ai
+      project: Dev Tools
+      trigger: true
+    - pipeline: engine
+      source: theo-dep-bo.conanci_engine
+      project: Dev Tools
+      trigger: true
+    - pipeline: graphics
+      source: theo-dep-bo.conanci_graphics
+      project: Dev Tools
+      trigger: true
+    - pipeline: mathlib
+      source: theo-dep-bo.conanci_mathlib
+      project: Dev Tools
+      trigger: true
+
+parameters:
+  - name: conanConfigUrl
+    type: string
+    default: https://github.com/theo-dep-bo/conanci_conf.git
+  - name: pool
+    type: string
+    default: Sandbox Blue Ortho 2
+
+variables:
+  CONAN_HOME: $(Build.SourcesDirectory)/.venv/.conan2
+  SYSTEM_USER: $(Build.RequestedForId)
+  SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+
+stages:
+  - stage: Lock
+    displayName: Compute build order
+    jobs:
+      - job: lock
+        displayName: Compute build order
+        pool:
+          name: ${{ parameters.pool }}
+          demands:
+            - Agent.OS -equals Linux
+        steps:
+          - checkout: github-products
+            path: s
+            clean: true
+
+          - checkout: github-game
+            clean: true
+
+          - checkout: github-mapviewer
+            clean: true
+
+          - template: .azure-pipelines/steps/install-conan.yml@conf
+            parameters:
+              conanConfigUrl: ${{ parameters.conanConfigUrl }}
+
+          - bash: |
+              set -e
+              source .venv/bin/activate
+              conan remote enable products
+              conan remote login products "$(SYSTEM_USER)" -p "$(SYSTEM_ACCESSTOKEN)"
+              conan remote enable develop
+              conan remote login develop "$(SYSTEM_USER)" -p "$(SYSTEM_ACCESSTOKEN)"
+            displayName: Configure remotes
+
+          - bash: |
+              set -e
+              source .venv/bin/activate
+              conan lock create "$(Build.SourcesDirectory)/conanci_game" -pr=windows --lockfile-out=conan.lock
+              conan lock create "$(Build.SourcesDirectory)/conanci_game" -pr=linux --lockfile=conan.lock --lockfile-out=conan.lock
+              conan lock create "$(Build.SourcesDirectory)/conanci_mapviewer" -pr=windows --lockfile=conan.lock --lockfile-out=conan.lock
+              conan lock create "$(Build.SourcesDirectory)/conanci_mapviewer" -pr=linux --lockfile=conan.lock --lockfile-out=conan.lock
+            displayName: Create lockfile
+
+          - bash: |
+              set -e
+              source .venv/bin/activate
+              conan graph build-order "$(Build.SourcesDirectory)/conanci_game" --lockfile=conan.lock --build="missing" -pr=windows --order-by=recipe --format=json > game_windows.json
+              conan graph build-order "$(Build.SourcesDirectory)/conanci_game" --lockfile=conan.lock --build="missing" -pr=linux --order-by=recipe --format=json > game_linux.json
+              conan graph build-order "$(Build.SourcesDirectory)/conanci_mapviewer" --lockfile=conan.lock --build="missing" -pr=windows --order-by=recipe --format=json > mapviewer_windows.json
+              conan graph build-order "$(Build.SourcesDirectory)/conanci_mapviewer" --lockfile=conan.lock --build="missing" -pr=linux --order-by=recipe --format=json > mapviewer_linux.json
+              conan graph build-order-merge \
+                --file=game_windows.json --file=game_linux.json \
+                --file=mapviewer_windows.json --file=mapviewer_linux.json \
+                --reduce --format=json > build_order.json
+            displayName: Compute build order
+
+          - publish: conan.lock
+            artifact: conan_lock
+            displayName: Publish lockfile
+
+          - publish: build_order.json
+            artifact: build_order
+            displayName: Publish build order
+
+          - bash: |
+              for i in 0 1 2 3; do
+                count=$(jq "(.order[$i] // []) | length" build_order.json)
+                has=$([[ $count -gt 0 ]] && echo true || echo false)
+                echo "##vso[task.setvariable variable=hasLevel${i};isOutput=true]${has}"
+              done
+            name: set_levels
+            displayName: Set level variables
+
+  - template: .azure-pipelines/stages/build-level.yml@conf
+    parameters:
+      levelIndex: 0
+      previousStage: Lock
+      pool: ${{ parameters.pool }}
+      conanConfigUrl: ${{ parameters.conanConfigUrl }}
+
+  - template: .azure-pipelines/stages/build-level.yml@conf
+    parameters:
+      levelIndex: 1
+      previousStage: Level0
+      pool: ${{ parameters.pool }}
+      conanConfigUrl: ${{ parameters.conanConfigUrl }}
+
+  - template: .azure-pipelines/stages/build-level.yml@conf
+    parameters:
+      levelIndex: 2
+      previousStage: Level1
+      pool: ${{ parameters.pool }}
+      conanConfigUrl: ${{ parameters.conanConfigUrl }}
+
+  - template: .azure-pipelines/stages/build-level.yml@conf
+    parameters:
+      levelIndex: 3
+      previousStage: Level2
+      pool: ${{ parameters.pool }}
+      conanConfigUrl: ${{ parameters.conanConfigUrl }}
+
+  - stage: Promotion
+    displayName: Promote packages
+    dependsOn:
+      - Level0
+      - Level1
+      - Level2
+      - Level3
+    condition: and(not(failed()), not(canceled()))
+    jobs:
+      - job: promotion
+        displayName: Promote
+        pool:
+          name: ${{ parameters.pool }}
+          demands:
+            - Agent.OS -equals Linux
+        steps:
+          - checkout: github-products
+            path: s
+            clean: true
+
+          - template: .azure-pipelines/steps/install-conan.yml@conf
+            parameters:
+              conanConfigUrl: ${{ parameters.conanConfigUrl }}
+
+          - bash: |
+              set -e
+              source .venv/bin/activate
+              conan remote enable products
+              conan remote login products "$(SYSTEM_USER)" -p "$(SYSTEM_ACCESSTOKEN)"
+              conan remote enable develop
+              conan remote login develop "$(SYSTEM_USER)" -p "$(SYSTEM_ACCESSTOKEN)"
+            displayName: Configure remotes
+
+          - download: current
+            displayName: Download all pkglists
+
+          - bash: |
+              set -e
+              source .venv/bin/activate
+              files=$(find "$(Pipeline.Workspace)" -name "uploaded_level*.json" -not -empty | sort)
+              if [ -z "$files" ]; then
+                echo "No packages to promote."
+                exit 0
+              fi
+              args=""
+              for f in $files; do
+                args="$args -l $f"
+              done
+              conan pkglist merge $args --format=json > uploaded.json
+              conan download --list=uploaded.json -r=products --format=json > promote.json
+              conan upload --list=promote.json -r=develop -c
+            displayName: Promote packages
