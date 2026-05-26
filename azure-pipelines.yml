@@ -75,8 +75,50 @@ stages:
   - stage: Lock
     displayName: Compute build order
     jobs:
+      - job: export_recipes
+        displayName: Export game and mapviewer recipes
+        pool:
+          name: ${{ parameters.pool }}
+          demands:
+            - Agent.OS -equals Linux
+        steps:
+          - checkout: github-products
+            path: s
+            clean: true
+
+          - checkout: github-game
+            clean: true
+
+          - checkout: github-mapviewer
+            clean: true
+
+          - template: .azure-pipelines/steps/install-conan.yml@conf
+            parameters:
+              conanConfigUrl: ${{ parameters.conanConfigUrl }}
+
+          - bash: |
+              set -e
+              source .venv/bin/activate
+              conan remote enable packages
+              conan remote login packages "$(SYSTEM_USER)" -p "$(SYSTEM_ACCESSTOKEN)"
+              conan remote enable products
+              conan remote login products "$(SYSTEM_USER)" -p "$(SYSTEM_ACCESSTOKEN)"
+            displayName: Configure remotes
+
+          - bash: |
+              set -e
+              source .venv/bin/activate
+              conan export "$(Build.SourcesDirectory)/conanci_game"
+              conan export "$(Build.SourcesDirectory)/conanci_mapviewer"
+              conan upload "game/*" -r=packages -c
+              conan upload "mapviewer/*" -r=packages -c
+              conan upload "game/*" -r=products -c
+              conan upload "mapviewer/*" -r=products -c
+            displayName: Export game and mapviewer recipes
+
       - job: lock
         displayName: Compute build order
+        dependsOn: export_recipes
         pool:
           name: ${{ parameters.pool }}
           demands:
@@ -117,6 +159,7 @@ stages:
           - bash: |
               set -e
               source .venv/bin/activate
+              conan remote disable products
               conan graph build-order "$(Build.SourcesDirectory)/conanci_game" --lockfile=conan.lock --build="missing" -pr=windows --order-by=recipe --format=json > game_windows.json
               conan graph build-order "$(Build.SourcesDirectory)/conanci_game" --lockfile=conan.lock --build="missing" -pr=linux --order-by=recipe --format=json > game_linux.json
               conan graph build-order "$(Build.SourcesDirectory)/conanci_mapviewer" --lockfile=conan.lock --build="missing" -pr=windows --order-by=recipe --format=json > mapviewer_windows.json
