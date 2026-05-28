@@ -159,7 +159,6 @@ stages:
           - bash: |
               set -e
               source .venv/bin/activate
-              conan remote disable products
               conan graph build-order --requires=game/1.0 --lockfile=conan.lock --build="missing" -pr=windows --order-by=recipe --format=json > game_windows.json
               conan graph build-order --requires=game/1.0 --lockfile=conan.lock --build="missing" -pr=linux --order-by=recipe --format=json > game_linux.json
               conan graph build-order --requires=mapviewer/1.0 --lockfile=conan.lock --build="missing" -pr=windows --order-by=recipe --format=json > mapviewer_windows.json
